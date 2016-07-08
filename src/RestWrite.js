@@ -2,7 +2,6 @@
 // that writes to the database.
 // This could be either a "create" or an "update".
 
-import cache from './cache';
 var SchemaController = require('./Controllers/SchemaController');
 var deepcopy = require('deepcopy');
 
@@ -12,6 +11,8 @@ var cryptoUtils = require('./cryptoUtils');
 var passwordCrypto = require('./password');
 var Parse = require('parse/node');
 var triggers = require('./triggers');
+import RestQuery from './RestQuery';
+import _         from 'lodash';
 
 // query and data are both provided in REST API format. So data
 // types are encoded by plain old objects.
@@ -30,8 +31,7 @@ function RestWrite(config, auth, className, query, data, originalData) {
   this.runOptions = {};
 
   if (!query && data.objectId) {
-    throw new Parse.Error(Parse.Error.INVALID_KEY_NAME, 'objectId ' +
-                          'is an invalid field name.');
+    throw new Parse.Error(Parse.Error.INVALID_KEY_NAME, 'objectId is an invalid field name.');
   }
 
   // When the operation is complete, this.response may have several
@@ -89,7 +89,7 @@ RestWrite.prototype.execute = function() {
     return this.cleanUserAuthData();
   }).then(() => {
     return this.response;
-  });
+  })
 };
 
 // Uses the Auth object to get the list of roles, adds the user id
@@ -104,26 +104,25 @@ RestWrite.prototype.getUserAndRoleACL = function() {
     return this.auth.getUserRoles().then((roles) => {
       roles.push(this.auth.user.id);
       this.runOptions.acl = this.runOptions.acl.concat(roles);
-      return Promise.resolve();
+      return;
     });
-  }else{
+  } else {
     return Promise.resolve();
   }
 };
 
 // Validates this operation against the allowClientClassCreation config.
 RestWrite.prototype.validateClientClassCreation = function() {
-  let sysClass = SchemaController.systemClasses;
   if (this.config.allowClientClassCreation === false && !this.auth.isMaster
-      && sysClass.indexOf(this.className) === -1) {
-    return this.config.database.collectionExists(this.className).then((hasClass) => {
-      if (hasClass === true) {
-        return Promise.resolve();
-      }
-
-      throw new Parse.Error(Parse.Error.OPERATION_FORBIDDEN,
-                            'This user is not allowed to access ' +
-                            'non-existent class: ' + this.className);
+      && SchemaController.systemClasses.indexOf(this.className) === -1) {
+    return this.config.database.loadSchema()
+      .then(schemaController => schemaController.hasClass(this.className))
+      .then(hasClass => {
+        if (hasClass !== true) {
+          throw new Parse.Error(Parse.Error.OPERATION_FORBIDDEN,
+                                'This user is not allowed to access ' +
+                                'non-existent class: ' + this.className);
+        }
     });
   } else {
     return Promise.resolve();
@@ -165,8 +164,10 @@ RestWrite.prototype.runBeforeTrigger = function() {
     return triggers.maybeRunTrigger(triggers.Types.beforeSave, this.auth, updatedObject, originalObject, this.config);
   }).then((response) => {
     if (response && response.object) {
+      if (!_.isEqual(this.data, response.object)) {
+        this.storage.changedByTrigger = true;
+      }
       this.data = response.object;
-      this.storage['changedByTrigger'] = true;
       // We should delete the objectId for an update write
       if (this.query && this.query.objectId) {
         delete this.data.objectId
@@ -306,9 +307,10 @@ RestWrite.prototype.handleAuthData = function(authData) {
         }
       }
     }
-    return Promise.resolve();
+    return;
   });
 }
+
 
 // The non-third-party parts of User transformation
 RestWrite.prototype.transformUser = function() {
@@ -318,9 +320,17 @@ RestWrite.prototype.transformUser = function() {
 
   var promise = Promise.resolve();
 
-  // If we're updating a _User object, clear the user cache for the session
-  if (this.query && this.auth.user && this.auth.user.getSessionToken()) {
-    cache.users.remove(this.auth.user.getSessionToken());
+  if (this.query) {
+    // If we're updating a _User object, we need to clear out the cache for that user. Find all their
+    // session tokens, and remove them from the cache.
+    promise = new RestQuery(this.config, Auth.master(this.config), '_Session', { user: {
+      __type: "Pointer",
+      className: "_User",
+      objectId: this.objectId(),
+    }}).execute()
+    .then(results => {
+      results.results.forEach(session => this.config.cacheController.user.del(session.sessionToken));
+    });
   }
 
   return promise.then(() => {
@@ -341,48 +351,47 @@ RestWrite.prototype.transformUser = function() {
     if (!this.data.username) {
       if (!this.query) {
         this.data.username = cryptoUtils.randomString(25);
+        this.responseShouldHaveUsername = true;
       }
       return;
     }
+    // We need to a find to check for duplicate username in case they are missing the unique index on usernames
+    // TODO: Check if there is a unique index, and if so, skip this query.
     return this.config.database.find(
-      this.className, {
-        username: this.data.username,
-        objectId: {'$ne': this.objectId()}
-      }, {limit: 1}).then((results) => {
-        if (results.length > 0) {
-          throw new Parse.Error(Parse.Error.USERNAME_TAKEN,
-                                'Account already exists for this username');
-        }
-        return Promise.resolve();
-      });
-  }).then(() => {
-    if (!this.data.email) {
+      this.className,
+      { username: this.data.username, objectId: {'$ne': this.objectId()} },
+      { limit: 1 }
+    )
+    .then(results => {
+      if (results.length > 0) {
+        throw new Parse.Error(Parse.Error.USERNAME_TAKEN, 'Account already exists for this username.');
+      }
+      return;
+    });
+  })
+  .then(() => {
+    if (!this.data.email || this.data.email.__op === 'Delete') {
       return;
     }
     // Validate basic email address format
     if (!this.data.email.match(/^.+@.+$/)) {
-      throw new Parse.Error(Parse.Error.INVALID_EMAIL_ADDRESS,
-                            'Email address format is invalid.');
+      throw new Parse.Error(Parse.Error.INVALID_EMAIL_ADDRESS, 'Email address format is invalid.');
     }
-    // Check for email uniqueness
+    // Same problem for email as above for username
     return this.config.database.find(
-      this.className, {
-        email: this.data.email,
-        objectId: {'$ne': this.objectId()}
-      }, {limit: 1}).then((results) => {
-        if (results.length > 0) {
-          throw new Parse.Error(Parse.Error.EMAIL_TAKEN,
-                                'Account already exists for this email ' +
-                                'address');
-        }
-        return Promise.resolve();
-      }).then(() => {
-        // We updated the email, send a new validation
-        this.storage['sendVerificationEmail'] = true;
-        this.config.userController.setEmailVerifyToken(this.data);
-        return Promise.resolve();
-      })
-  });
+      this.className,
+      { email: this.data.email, objectId: {'$ne': this.objectId()} },
+      { limit: 1 }
+    )
+    .then(results => {
+      if (results.length > 0) {
+        throw new Parse.Error(Parse.Error.EMAIL_TAKEN, 'Account already exists for this email address.');
+      }
+      // We updated the email, send a new validation
+      this.storage['sendVerificationEmail'] = true;
+      this.config.userController.setEmailVerifyToken(this.data);
+    });
+  })
 };
 
 RestWrite.prototype.createSessionTokenIfNeeded = function() {
@@ -413,8 +422,7 @@ RestWrite.prototype.createSessionTokenIfNeeded = function() {
   if (this.response && this.response.response) {
     this.response.response.sessionToken = token;
   }
-  var create = new RestWrite(this.config, Auth.master(this.config),
-                                 '_Session', null, sessionData);
+  var create = new RestWrite(this.config, Auth.master(this.config), '_Session', null, sessionData);
   return create.execute();
 }
 
@@ -438,24 +446,6 @@ RestWrite.prototype.handleFollowup = function() {
     // Fire and forget!
     this.config.userController.sendVerificationEmail(this.data);
     this.handleFollowup.bind(this);
-  }
-};
-
-// Handles the _Role class specialness.
-// Does nothing if this isn't a role object.
-RestWrite.prototype.handleRole = function() {
-  if (this.response || this.className !== '_Role') {
-    return;
-  }
-
-  if (!this.auth.user && !this.auth.isMaster) {
-    throw new Parse.Error(Parse.Error.INVALID_SESSION_TOKEN,
-                          'Session token required.');
-  }
-
-  if (!this.data.name) {
-    throw new Parse.Error(Parse.Error.INVALID_ROLE_NAME,
-                          'Invalid role name.');
   }
 };
 
@@ -499,8 +489,7 @@ RestWrite.prototype.handleSession = function() {
       }
       sessionData[key] = this.data[key];
     }
-    var create = new RestWrite(this.config, Auth.master(this.config),
-                               '_Session', null, sessionData);
+    var create = new RestWrite(this.config, Auth.master(this.config), '_Session', null, sessionData);
     return create.execute().then((results) => {
       if (!results.response) {
         throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR,
@@ -585,7 +574,7 @@ RestWrite.prototype.handleInstallation = function() {
                                 'deviceType may not be changed in this ' +
                                 'operation');
         }
-        return Promise.resolve();
+        return;
       });
     });
   }
@@ -716,11 +705,14 @@ RestWrite.prototype.runDatabaseOperation = function() {
     return;
   }
 
+  if (this.className === '_Role') {
+    this.config.cacheController.role.clear();
+  }
+
   if (this.className === '_User' &&
       this.query &&
       !this.auth.couldUpdateUserId(this.query.objectId)) {
-    throw new Parse.Error(Parse.Error.SESSION_MISSING,
-                          'cannot modify user ' + this.query.objectId);
+    throw new Parse.Error(Parse.Error.SESSION_MISSING, `Cannot modify user ${this.query.objectId}.`);
   }
 
   if (this.className === '_Product' && this.data.download) {
@@ -740,19 +732,16 @@ RestWrite.prototype.runDatabaseOperation = function() {
       this.data.ACL[this.query.objectId] = { read: true, write: true };
     }
     // Run an update
-    return this.config.database.update(
-      this.className, this.query, this.data, this.runOptions).then((resp) => {
-        resp.updatedAt = this.updatedAt;
-        if (this.storage['changedByTrigger']) {
-          resp = Object.keys(this.data).reduce((memo, key) => {
-            memo[key] = resp[key] || this.data[key];
-            return memo;
-          }, resp);
-        }
-        this.response = {
-          response: resp
-        };
-      });
+    return this.config.database.update(this.className, this.query, this.data, this.runOptions)
+    .then(response => {
+      response.updatedAt = this.updatedAt;
+      if (this.storage.changedByTrigger) {
+        Object.keys(this.data).forEach(fieldName => {
+          response[fieldName] = response[fieldName] || this.data[fieldName];
+        });
+      }
+      this.response = { response };
+    });
   } else {
     // Set the default ACL for the new _User
     if (this.className === '_User') {
@@ -769,23 +758,54 @@ RestWrite.prototype.runDatabaseOperation = function() {
 
     // Run a create
     return this.config.database.create(this.className, this.data, this.runOptions)
-      .then((resp) => {
-        Object.assign(resp, {
-          objectId: this.data.objectId,
-          createdAt: this.data.createdAt
-        });
-        if (this.storage['changedByTrigger']) {
-          resp = Object.keys(this.data).reduce((memo, key) => {
-            memo[key] = resp[key] || this.data[key];
-            return memo;
-          }, resp);
+    .catch(error => {
+      if (this.className !== '_User' || error.code !== Parse.Error.DUPLICATE_VALUE) {
+        throw error;
+      }
+      // If this was a failed user creation due to username or email already taken, we need to
+      // check whether it was username or email and return the appropriate error.
+
+      // TODO: See if we can later do this without additional queries by using named indexes.
+      return this.config.database.find(
+        this.className,
+        { username: this.data.username, objectId: {'$ne': this.objectId()} },
+        { limit: 1 }
+      )
+      .then(results => {
+        if (results.length > 0) {
+          throw new Parse.Error(Parse.Error.USERNAME_TAKEN, 'Account already exists for this username.');
         }
-        this.response = {
-          status: 201,
-          response: resp,
-          location: this.location()
-        };
+        return this.config.database.find(
+          this.className,
+          { email: this.data.email, objectId: {'$ne': this.objectId()} },
+          { limit: 1 }
+        );
+      })
+      .then(results => {
+        if (results.length > 0) {
+          throw new Parse.Error(Parse.Error.EMAIL_TAKEN, 'Account already exists for this email address.');
+        }
+        throw new Parse.Error(Parse.Error.DUPLICATE_VALUE, 'A duplicate value for a field with unique values was provided');
       });
+    })
+    .then(response => {
+      response.objectId = this.data.objectId;
+      response.createdAt = this.data.createdAt;
+      
+      if (this.responseShouldHaveUsername) {
+        response.username = this.data.username;
+      }
+      if (this.storage.changedByTrigger) {
+        Object.keys(this.data).forEach(fieldName => {
+          response[fieldName] = response[fieldName] || this.data[fieldName];
+        });
+      }
+      this.response = {
+        status: 201,
+        response,
+        location: this.location()
+      };
+    });
   }
 };
 
